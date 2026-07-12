@@ -5,7 +5,8 @@ import base64
 import math
 import threading
 import time
-from openai import OpenAI          # Featherless is OpenAI-compatible
+from openai import OpenAI          
+import anthropic                   
 import pyttsx3                      # local text-to-speech
 import speech_recognition as sr     # voice questions
 
@@ -13,48 +14,67 @@ import speech_recognition as sr     # voice questions
 import os
 from dotenv import load_dotenv
 
-load_dotenv()  # reads .env in the current working directory into os.environ
+load_dotenv()  
 
 FEATHERLESS_KEY = os.environ.get("FEATHERLESS_API_KEY")
-if not FEATHERLESS_KEY:
-    raise SystemExit(
-        "FEATHERLESS_API_KEY is not set.\n"
-        "Add this line to a .env file in the same folder as this script:\n"
-        "FEATHERLESS_API_KEY=your-key-here\n"
-        "(no quotes, no 'export', no spaces around the '=')"
-    )
+ANTHROPIC_KEY = os.environ.get("ANTHROPIC_API_KEY")
 
-client = OpenAI(
+featherless_client = OpenAI(
     base_url="https://api.featherless.ai/v1",
     api_key=FEATHERLESS_KEY,
-    timeout=60.0,  
-)
+    timeout=60.0,
+) if FEATHERLESS_KEY else None
 
-VISION_MODEL = "MiniMaxAI/MiniMax-M3"  
+claude_client = anthropic.Anthropic(api_key=ANTHROPIC_KEY) if ANTHROPIC_KEY else None
+
+if featherless_client is None and claude_client is None:
+    raise SystemExit(
+        "No API keys found. Add FEATHERLESS_API_KEY and/or ANTHROPIC_API_KEY to a .env file\n"
+        "in the same folder as this script (no quotes, no 'export')."
+    )
+
+VISION_MODEL = "MiniMaxAI/MiniMax-M3"   # Featherless multimodal model
+CLAUDE_MODEL = "claude-opus-4-8"        # Anthropic vision model
+PROVIDER = "featherless" if featherless_client else "claude"  # chosen on the setup screen
 DEFAULT_QUESTION = "What's in this image?"
 
 
 def ask_about_crop(crop_img, question=DEFAULT_QUESTION):
-    """Send a cropped frame to the vision model and get back a short description."""
+    """Send a cropped frame to whichever vision model the user picked; return a short description."""
     ok, buf = cv2.imencode(".png", crop_img)
     if not ok:
         return "couldn't encode crop"
     b64 = base64.b64encode(buf).decode("utf-8")
-
-    messages = [{
-        "role": "user",
-        "content": [
-            {"type": "text", "text": f"{question} Answer in one or two short, complete sentences. No preamble, just the answer."},
-            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}}
-        ]
-    }]
+    prompt = f"{question} Answer in one or two short, complete sentences. No preamble, just the answer."
 
     try:
-        
+        if PROVIDER == "claude":
+            response = claude_client.messages.create(
+                model=CLAUDE_MODEL,
+                max_tokens=300,
+                messages=[{
+                    "role": "user",
+                    "content": [
+                        {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": b64}},
+                        {"type": "text", "text": prompt},
+                    ],
+                }],
+            )
+            text = next((b.text for b in response.content if b.type == "text"), "").strip()
+            return text or "the model returned a blank answer -- try again or reframe the object"
+
+        # Featherless / OpenAI-compatible path (retry once on an empty message)
+        messages = [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": prompt},
+                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}},
+            ],
+        }]
         for _ in range(2):
-            response = client.chat.completions.create(
+            response = featherless_client.chat.completions.create(
                 model=VISION_MODEL,
-                max_tokens=2048,  
+                max_tokens=2048,
                 messages=messages,
             )
             content = (response.choices[0].message.content or "").strip()
@@ -68,7 +88,9 @@ def ask_about_crop(crop_img, question=DEFAULT_QUESTION):
         if "concurren" in msg or "429" in msg or "rate limit" in msg:
             return "too many requests right now, give it a second and try again"
         if "capacity" in msg or "503" in msg:
-            return "model is temporarily at capacity on Featherless -- try again in a few seconds"
+            return "model is temporarily at capacity -- try again in a few seconds"
+        if "authentication" in msg or "401" in msg:
+            return "API key error -- check your key in the .env file"
         raise
 
 
@@ -253,7 +275,7 @@ def run_detection(crop):
 def cancel_current():
     """Cuts off an in-progress listen/think/speak cycle."""
     global request_id, detecting, status_text
-    request_id += 1  # any in-flight thread will see this mismatch and discard its result
+    request_id += 1  
     detecting = False
     status_text = ""
     if active_tts_engine is not None:
@@ -324,6 +346,139 @@ def trigger_clear():
     canvas = np.zeros_like(canvas)
     box_min_x = box_min_y = box_max_x = box_max_y = None
     detect_result = ""
+
+
+# ==================== setup + gesture tutorial ====================
+
+def _hand_flags(hl, w, h):
+    """Booleans for the single-hand gestures -- same logic the main loop uses."""
+    t = hl.landmark
+    index_up = t[8].y < t[6].y
+    middle_up = t[12].y < t[10].y
+    ring_up = t[16].y < t[14].y
+    pinky_up = t[20].y < t[18].y
+    thumb_up = t[4].y < t[3].y
+    ix, iy = int(t[8].x * w), int(t[8].y * h)
+    tx, ty = int(t[4].x * w), int(t[4].y * h)
+    pinch = math.hypot(ix - tx, iy - ty) < PINCH_PX
+    return {
+        "pinch": pinch,
+        "open_palm": index_up and middle_up and ring_up and pinky_up,
+        "fist": (not index_up and not middle_up and not ring_up and not pinky_up and not thumb_up),
+        "thumbs_up": thumb_up and not index_up and not middle_up and not ring_up and not pinky_up,
+        "three": index_up and middle_up and ring_up and not pinky_up,
+    }
+
+
+def _banner(img, lines, y0=40, scale=0.7, color=(255, 255, 255)):
+    """Draw readable text (black outline + colored fill) at the top-left."""
+    for i, line in enumerate(lines):
+        pos = (20, y0 + i * 34)
+        cv2.putText(img, line, pos, cv2.FONT_HERSHEY_SIMPLEX, scale, (0, 0, 0), 4)
+        cv2.putText(img, line, pos, cv2.FONT_HERSHEY_SIMPLEX, scale, color, 1)
+
+
+def choose_provider():
+    """Setup screen -- pick the vision model. Sets and returns the global PROVIDER."""
+    global PROVIDER
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            return PROVIDER
+        frame = cv2.flip(frame, 1)
+        h, w, _ = frame.shape
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (0, 0), (w, h), (0, 0, 0), -1)
+        frame = cv2.addWeighted(overlay, 0.72, frame, 0.28, 0)
+
+        f_ok = featherless_client is not None
+        c_ok = claude_client is not None
+        _banner(frame, ["EyeQ  --  choose your vision model"], y0=70, scale=1.0, color=(0, 255, 255))
+        _banner(frame, [
+            f"[1]  Featherless   {VISION_MODEL}" + ("" if f_ok else "   (no key in .env)"),
+            f"[2]  Claude        {CLAUDE_MODEL}" + ("" if c_ok else "   (no key in .env)"),
+            "",
+            "Press 1 or 2 to choose.    ESC = keep default.",
+        ], y0=160, scale=0.7)
+        cv2.imshow("Drawing", frame)
+        k = cv2.waitKey(1) & 0xFF
+        if k == 27:
+            return PROVIDER
+        if k == ord('1') and f_ok:
+            PROVIDER = "featherless"
+            return PROVIDER
+        if k == ord('2') and c_ok:
+            PROVIDER = "claude"
+            return PROVIDER
+
+
+TUTORIAL_STEPS = [
+    ("OPEN PALM", "Open hand, all 4 fingers up  ->  CLEAR the canvas/box", "open_palm"),
+    ("PINCH", "Touch thumb + index together  ->  ASK the AI about your drawing", "pinch"),
+    ("FIST", "Close all fingers into a fist  ->  CANCEL / stop the AI", "fist"),
+    ("THUMBS UP", "Thumb up, other fingers curled  ->  SWITCH Draw / Box mode", "thumbs_up"),
+    ("THREE FINGERS", "Index+middle+ring up, pinky down  ->  3-2-1 timed SNAPSHOT", "three"),
+    ("TWO HANDS", "Show BOTH hands, move apart/together  ->  ZOOM the view", "two_hands"),
+]
+
+
+def run_tutorial():
+    """Walk through each gesture; only advance once the user actually performs it."""
+    total = len(TUTORIAL_STEPS)
+    for idx, (title, desc, key) in enumerate(TUTORIAL_STEPS):
+        streak = 0
+        done_at = None
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                return
+            frame = cv2.flip(frame, 1)
+            h, w, _ = frame.shape
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            res = hands.process(rgb)
+
+            active = False
+            if res.multi_hand_landmarks:
+                for hl in res.multi_hand_landmarks:
+                    mp_draw.draw_landmarks(frame, hl, mp_hands.HAND_CONNECTIONS)
+                if key == "two_hands":
+                    active = len(res.multi_hand_landmarks) >= 2
+                elif len(res.multi_hand_landmarks) == 1:
+                    active = _hand_flags(res.multi_hand_landmarks[0], w, h).get(key, False)
+
+            if done_at is None:
+                streak = streak + 1 if active else 0
+                if streak >= STABLE_FRAMES:
+                    done_at = time.time()
+
+            overlay = frame.copy()
+            cv2.rectangle(overlay, (0, 0), (w, 150), (0, 0, 0), -1)
+            cv2.rectangle(overlay, (0, h - 55), (w, h), (0, 0, 0), -1)
+            frame = cv2.addWeighted(overlay, 0.6, frame, 0.4, 0)
+            _banner(frame, [f"STEP {idx + 1}/{total}:  {title}"], y0=45, scale=0.9, color=(0, 255, 255))
+            _banner(frame, [desc], y0=95, scale=0.6)
+            _banner(frame, ["S = skip step     ESC = skip tutorial"], y0=h - 22, scale=0.55, color=(180, 180, 180))
+
+            if done_at is None:
+                frac = min(streak / STABLE_FRAMES, 1.0)
+                cv2.rectangle(frame, (20, 122), (20 + int((w - 40) * frac), 136), (0, 200, 0), -1)
+                cv2.rectangle(frame, (20, 122), (w - 20, 136), (255, 255, 255), 1)
+            else:
+                cv2.putText(frame, "NICE!", (w // 2 - 120, h // 2),
+                            cv2.FONT_HERSHEY_SIMPLEX, 2.5, (0, 255, 0), 6)
+
+            cv2.imshow("Drawing", frame)
+            k = cv2.waitKey(1) & 0xFF
+            if k == 27:
+                return
+            if k == ord('s'):
+                break
+            if done_at is not None and time.time() - done_at > 0.8:
+                break
+
+
+choose_provider()
+run_tutorial()
 
 
 while True:
