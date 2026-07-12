@@ -9,9 +9,7 @@ from openai import OpenAI          # Featherless is OpenAI-compatible
 import pyttsx3                      # local text-to-speech
 import speech_recognition as sr     # voice questions
 
-# ---------------- Featherless (OpenAI-compatible) ----------------
-# pip install openai pyttsx3 SpeechRecognition pyaudio
-# export FEATHERLESS_API_KEY="your-key-here"
+
 import os
 from dotenv import load_dotenv
 
@@ -29,11 +27,10 @@ if not FEATHERLESS_KEY:
 client = OpenAI(
     base_url="https://api.featherless.ai/v1",
     api_key=FEATHERLESS_KEY,
-    timeout=25.0,  # fail with a clear error instead of hanging on a cold-start model
+    timeout=60.0,  
 )
 
-VISION_MODEL = "MiniMaxAI/MiniMax-M3"  # Featherless multimodal model
-
+VISION_MODEL = "MiniMaxAI/MiniMax-M3"  
 DEFAULT_QUESTION = "What's in this image?"
 
 
@@ -44,25 +41,34 @@ def ask_about_crop(crop_img, question=DEFAULT_QUESTION):
         return "couldn't encode crop"
     b64 = base64.b64encode(buf).decode("utf-8")
 
+    messages = [{
+        "role": "user",
+        "content": [
+            {"type": "text", "text": f"{question} Answer in one or two short, complete sentences. No preamble, just the answer."},
+            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}}
+        ]
+    }]
+
     try:
-        response = client.chat.completions.create(
-            model=VISION_MODEL,
-            max_tokens=80,  # enough headroom to finish a sentence, low enough it can't ramble
-            messages=[{
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": f"{question} Answer in one or two short, complete sentences. No preamble, just the answer."},
-                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}}
-                ]
-            }]
-        )
-        return response.choices[0].message.content
+        
+        for _ in range(2):
+            response = client.chat.completions.create(
+                model=VISION_MODEL,
+                max_tokens=2048,  
+                messages=messages,
+            )
+            content = (response.choices[0].message.content or "").strip()
+            if content:
+                return content
+        return "the model returned a blank answer -- try again or reframe the object"
     except Exception as e:
         msg = str(e).lower()
         if "timeout" in msg or "timed out" in msg:
             return "model took too long to respond (likely warming up on a cold start) -- try again in a few seconds"
         if "concurren" in msg or "429" in msg or "rate limit" in msg:
             return "too many requests right now, give it a second and try again"
+        if "capacity" in msg or "503" in msg:
+            return "model is temporarily at capacity on Featherless -- try again in a few seconds"
         raise
 
 
@@ -143,23 +149,20 @@ box_min_x = box_min_y = box_max_x = box_max_y = None
 box_last_pos = None
 box_last_move_time = 0
 box_locked = False
-STILL_PX = 8            # movement under this is considered "holding still"
-HOLD_TIME = 0.5          # seconds of stillness before the box freezes
+STILL_PX = 8           
+HOLD_TIME = 0.5        
 
 detecting = False
 detect_result = ""
-status_text = ""  # shows "listening..." etc
+status_text = "" 
 
-request_id = 0            # bumped on every new trigger AND on cancel; stale threads discard their result
+request_id = 0            
 active_tts_engine = None  # so a cancel can stop speech mid-sentence
 
-in_flight_count = 0        # requests currently running server-side (even canceled ones, until they finish)
-MAX_IN_FLIGHT = 2          # stay well under Featherless's per-plan concurrency limit
+in_flight_count = 0        #
+MAX_IN_FLIGHT = 2          
 
-# ---- gesture-trigger debounce state, tracked per hand index ----
-# instead of firing the instant a gesture is detected for one frame (jittery,
-# causes accidental mode switches), each gesture must hold for STABLE_FRAMES
-# consecutive frames before it fires.
+
 pinch_streak = {}
 open_palm_streak = {}
 fist_streak = {}
@@ -174,7 +177,7 @@ PINCH_PX = 40          # thumb tip to index tip distance threshold, in pixels
 GESTURE_COOLDOWN = 1.5  # seconds, prevents immediate re-trigger after firing
 last_trigger_time = 0
 
-# ---- new-feature state (none of this touches the AI request/response path) ----
+
 EMA_ALPHA = 0.5            # fingertip smoothing: higher = snappier, lower = smoother
 smoothed_points = {}       # hand i -> (sx, sy), exponential moving average of the fingertip
 
@@ -217,6 +220,7 @@ def run_detection(crop):
     my_id = request_id
     in_flight_count += 1
     try:
+        print("[detect] started, listening on mic...", flush=True)
         status_text = "listening..."
         question = listen_for_question()
         if request_id != my_id:
@@ -224,8 +228,10 @@ def run_detection(crop):
 
         if not question:
             question = DEFAULT_QUESTION
+        print(f"[detect] question = {question!r}; asking model...", flush=True)
         status_text = "thinking..."
         result = ask_about_crop(crop, question)
+        print(f"[detect] model returned = {result!r}", flush=True)
 
         if request_id != my_id:
             return  # canceled while the model was responding
@@ -234,6 +240,7 @@ def run_detection(crop):
         status_text = ""
         threading.Thread(target=speak, args=(detect_result,), daemon=True).start()
     except Exception as e:
+        print(f"[detect] EXCEPTION: {type(e).__name__}: {e}", flush=True)
         if request_id == my_id:
             detect_result = f"error: {e}"
             status_text = ""
@@ -301,10 +308,15 @@ def trigger_detect(clean_frame):
         crop = clean_frame[box_min_y:box_max_y, box_min_x:box_max_x].copy()
 
     if crop is not None and crop.size > 0:
+        print(f"[trigger] fired in {mode} mode, crop {crop.shape}", flush=True)
         request_id += 1
         detecting = True
         detect_result = ""
         threading.Thread(target=run_detection, args=(crop,), daemon=True).start()
+    else:
+        print(f"[trigger] NO-OP: nothing to analyze in {mode} mode "
+              f"(draw something first, or drag a box)", flush=True)
+        status_text = "nothing to analyze -- draw or box something first"
 
 
 def trigger_clear():
@@ -405,9 +417,7 @@ while True:
 
                 # ---- closed fist (all five fingers curled, including thumb) -> cancel/cut off the AI ----
                 is_fist = not index_up and not middle_up and not ring_up and not pinky_up and not thumb_up
-                # fire while thinking OR while speaking -- detecting drops to False the moment
-                # the speak thread launches, so guarding on `detecting` alone would make it
-                # impossible to cut off the TTS mid-sentence.
+
                 if gesture_confirmed(fist_streak, fist_fired, i, is_fist) \
                         and (detecting or active_tts_engine is not None) \
                         and (now - last_trigger_time) > GESTURE_COOLDOWN:
@@ -467,8 +477,7 @@ while True:
 
     mask = canvas.astype(bool).any(axis=2)
     frame[mask] = canvas[mask]
-    clean_frame = frame.copy()  # unzoomed camera+ink -- the AI always analyzes THIS, never the zoomed view
-
+    clean_frame = frame.copy()  
     display = frame
 
     # ---- dynamic digital zoom: crop a centered region and scale it back up (scene only) ----
