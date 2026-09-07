@@ -1,0 +1,9 @@
+opencv-python
+numpy
+mediapipe
+openai
+anthropic
+pyttsx3
+SpeechRecognition
+python-dotenv
+PyAudio

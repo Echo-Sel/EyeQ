@@ -25,7 +25,7 @@ jobs:
 
       - name: Build exe
         run: |
-          pyinstaller --onefile --collect-all mediapipe --name EyeQ eyeq.py
+          pyinstaller --onefile --collect-all mediapipe --name EyeQ main.py
 
       - name: Create GitHub Release and upload exe
         uses: softprops/action-gh-release@v2
