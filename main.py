@@ -5,19 +5,75 @@ import base64
 import math
 import threading
 import time
-from openai import OpenAI          
-import anthropic                   
+from openai import OpenAI
+import anthropic
 import pyttsx3                      # local text-to-speech
 import speech_recognition as sr     # voice questions
 
-
+import sys
 import os
 from dotenv import load_dotenv
 
-load_dotenv()  
+
+
+def get_app_dir():
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+APP_DIR = get_app_dir()
+ENV_PATH = os.path.join(APP_DIR, ".env")
+
+load_dotenv(dotenv_path=ENV_PATH)
 
 FEATHERLESS_KEY = os.environ.get("FEATHERLESS_API_KEY")
 ANTHROPIC_KEY = os.environ.get("ANTHROPIC_API_KEY")
+
+
+def prompt_for_keys():
+    """First-run setup: ask in the console for whichever key(s) are missing
+    and write them to a .env next to the exe, so this only has to happen
+    once. Returns the (possibly updated) key values."""
+    global FEATHERLESS_KEY, ANTHROPIC_KEY
+
+    print("=" * 60)
+    print("EyeQ setup -- no API key(s) found.")
+    print("You need at least one of:")
+    print("  - a Featherless API key (https://featherless.ai)")
+    print("  - an Anthropic API key  (https://console.anthropic.com)")
+    print("Press Enter to skip either one.")
+    print("=" * 60)
+
+    if not FEATHERLESS_KEY:
+        entered = input("Featherless API key (or Enter to skip): ").strip()
+        if entered:
+            FEATHERLESS_KEY = entered
+
+    if not ANTHROPIC_KEY:
+        entered = input("Anthropic API key (or Enter to skip): ").strip()
+        if entered:
+            ANTHROPIC_KEY = entered
+
+    lines = []
+    if FEATHERLESS_KEY:
+        lines.append(f"FEATHERLESS_API_KEY={FEATHERLESS_KEY}")
+    if ANTHROPIC_KEY:
+        lines.append(f"ANTHROPIC_API_KEY={ANTHROPIC_KEY}")
+
+    if lines:
+        try:
+            with open(ENV_PATH, "w") as f:
+                f.write("\n".join(lines) + "\n")
+            print(f"Saved to {ENV_PATH} -- you won't be asked again.")
+        except Exception as e:
+            print(f"Couldn't write .env file ({e}); you'll be asked again next run.")
+
+    return FEATHERLESS_KEY, ANTHROPIC_KEY
+
+
+if not FEATHERLESS_KEY and not ANTHROPIC_KEY:
+    FEATHERLESS_KEY, ANTHROPIC_KEY = prompt_for_keys()
 
 featherless_client = OpenAI(
     base_url="https://api.featherless.ai/v1",
@@ -28,13 +84,15 @@ featherless_client = OpenAI(
 claude_client = anthropic.Anthropic(api_key=ANTHROPIC_KEY) if ANTHROPIC_KEY else None
 
 if featherless_client is None and claude_client is None:
-    raise SystemExit(
-        "No API keys found. Add FEATHERLESS_API_KEY and/or ANTHROPIC_API_KEY to a .env file\n"
-        "in the same folder as this script (no quotes, no 'export')."
+    print(
+        "No API keys provided. Add FEATHERLESS_API_KEY and/or ANTHROPIC_API_KEY to\n"
+        f"the .env file at {ENV_PATH}, or re-run and enter one when prompted."
     )
+    input("Press Enter to exit...")
+    raise SystemExit(1)
 
 VISION_MODEL = "MiniMaxAI/MiniMax-M3"   # Featherless multimodal model
-CLAUDE_MODEL = "claude-opus-4-8"        # Anthropic vision model
+CLAUDE_MODEL = "claude-haiku-4-5-20251001"  # Anthropic vision model (cheapest current tier)
 PROVIDER = "featherless" if featherless_client else "claude"  # chosen on the setup screen
 DEFAULT_QUESTION = "What's in this image?"
 
@@ -171,18 +229,18 @@ box_min_x = box_min_y = box_max_x = box_max_y = None
 box_last_pos = None
 box_last_move_time = 0
 box_locked = False
-STILL_PX = 8           
-HOLD_TIME = 0.5        
+STILL_PX = 8
+HOLD_TIME = 0.5
 
 detecting = False
 detect_result = ""
-status_text = "" 
+status_text = ""
 
-request_id = 0            
+request_id = 0
 active_tts_engine = None  # so a cancel can stop speech mid-sentence
 
-in_flight_count = 0        #
-MAX_IN_FLIGHT = 2          
+in_flight_count = 0
+MAX_IN_FLIGHT = 2
 
 
 pinch_streak = {}
@@ -275,7 +333,7 @@ def run_detection(crop):
 def cancel_current():
     """Cuts off an in-progress listen/think/speak cycle."""
     global request_id, detecting, status_text
-    request_id += 1  
+    request_id += 1
     detecting = False
     status_text = ""
     if active_tts_engine is not None:
@@ -632,7 +690,7 @@ while True:
 
     mask = canvas.astype(bool).any(axis=2)
     frame[mask] = canvas[mask]
-    clean_frame = frame.copy()  
+    clean_frame = frame.copy()
     display = frame
 
     # ---- dynamic digital zoom: crop a centered region and scale it back up (scene only) ----
@@ -649,7 +707,7 @@ while True:
         if elapsed >= COUNTDOWN_SECS:
             frozen_frame = scene.copy()
             snapshot_count += 1
-            cv2.imwrite(f"snapshot_{snapshot_count}.png", frozen_frame)
+            cv2.imwrite(os.path.join(APP_DIR, f"snapshot_{snapshot_count}.png"), frozen_frame)
             frozen_until = now + 3.0
             countdown_active = False
         else:
