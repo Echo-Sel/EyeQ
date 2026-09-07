@@ -1,6 +1,6 @@
 # EyeQ
 
-EyeQ turns your webcam into a hand-gesture-controlled drawing and vision assistant. Draw or box an object in the air using just your hand, then ask an AI what it's looking at — out loud.
+EyeQ turns your webcam into a hand-gesture-controlled drawing and vision assistant. Draw or box an object in the air using just your hand, then ask an AI what it's looking at 
 
 ## What it does
 
